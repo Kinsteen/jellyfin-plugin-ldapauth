@@ -11,6 +11,7 @@ using Jellyfin.Data.Entities;
 using Jellyfin.Data.Enums;
 using Jellyfin.Plugin.LDAP_Auth.Api.Helpers;
 using Jellyfin.Plugin.LDAP_Auth.Api.Models;
+using Jellyfin.Plugin.LDAP_Auth.Config;
 using Jellyfin.Plugin.LDAP_Auth.Helpers;
 using MediaBrowser.Common;
 using MediaBrowser.Controller.Authentication;
@@ -18,7 +19,6 @@ using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Users;
-using Microsoft.AspNetCore.Routing.Matching;
 using Microsoft.Extensions.Logging;
 using Novell.Directory.Ldap;
 
@@ -31,16 +31,19 @@ namespace Jellyfin.Plugin.LDAP_Auth
     {
         private readonly ILogger<LdapAuthenticationProviderPlugin> _logger;
         private readonly IApplicationHost _applicationHost;
+        private readonly IHttpClientFactory _httpClientFactory;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="LdapAuthenticationProviderPlugin"/> class.
         /// </summary>
         /// <param name="applicationHost">Instance of the <see cref="IApplicationHost"/> interface.</param>
         /// <param name="logger">Instance of the <see cref="ILogger{LdapAuthenticationProviderPlugin}"/> interface.</param>
-        public LdapAuthenticationProviderPlugin(IApplicationHost applicationHost, ILogger<LdapAuthenticationProviderPlugin> logger)
+        /// <param name="httpClientFactory">Instance of the <see cref="IHttpClientFactory"/> interface.</param>
+        public LdapAuthenticationProviderPlugin(IApplicationHost applicationHost, ILogger<LdapAuthenticationProviderPlugin> logger, IHttpClientFactory httpClientFactory)
         {
             _logger = logger;
             _applicationHost = applicationHost;
+            _httpClientFactory = httpClientFactory;
         }
 
         private string[] LdapUsernameAttributes => LdapPlugin.Instance.Configuration.LdapSearchAttributes.Replace(" ", string.Empty, StringComparison.Ordinal).Split(',');
@@ -53,7 +56,7 @@ namespace Jellyfin.Plugin.LDAP_Auth
 
         private string ProfileImageAttr => LdapPlugin.Instance.Configuration.LdapProfileImageAttribute;
 
-        private string ProfileImageAttrFormat => LdapPlugin.Instance.Configuration.LdapProfileImageAttributeFormat;
+        private PluginConfiguration.ProfileImageAttributeFormat ProfileImageAttrFormat => LdapPlugin.Instance.Configuration.LdapProfileImageAttributeFormat;
 
         private string SearchFilter => LdapPlugin.Instance.Configuration.LdapSearchFilter;
 
@@ -205,28 +208,31 @@ namespace Jellyfin.Plugin.LDAP_Auth
 
                     var providerManager = _applicationHost.Resolve<IProviderManager>();
                     var serverConfigurationManager = _applicationHost.Resolve<IServerConfigurationManager>();
-                    byte[] ldapProfileImage = null;
-                    if (ProfileImageAttrFormat == "base64")
+                    Task<byte[]> ldapProfileImageTask = null;
+                    var attribute = GetAttribute(ldapUser, ProfileImageAttr);
+                    if (attribute != null)
                     {
-                        ldapProfileImage = Convert.FromBase64String(GetAttribute(ldapUser, ProfileImageAttr)?.StringValue);
-                    }
-                    else if (ProfileImageAttrFormat == "binary")
-                    {
-                        ldapProfileImage = GetAttribute(ldapUser, ProfileImageAttr)?.ByteValue;
-                    }
-                    else if (ProfileImageAttrFormat == "url")
-                    {
-                        using var client = new HttpClient();
-                        ldapProfileImage = await client.GetByteArrayAsync(GetAttribute(ldapUser, ProfileImageAttr)?.StringValue);
-                    }
-                    else
-                    {
-                        _logger.LogError("Unknown profile image format: {Format}", ProfileImageAttrFormat);
+                        switch (ProfileImageAttrFormat)
+                        {
+                            case PluginConfiguration.ProfileImageAttributeFormat.BINARY:
+                                ldapProfileImageTask = Task.FromResult(attribute.ByteValue);
+                                break;
+                            case PluginConfiguration.ProfileImageAttributeFormat.BASE64:
+                                ldapProfileImageTask = Task.FromResult(Convert.FromBase64String(attribute.StringValue));
+                                break;
+                            case PluginConfiguration.ProfileImageAttributeFormat.URL:
+                            {
+                                using var client = _httpClientFactory.CreateClient();
+                                ldapProfileImageTask = client.GetByteArrayAsync(attribute.StringValue);
+                                break;
+                            }
+                        }
                     }
 
                     var ldapProfileImageHash = string.Empty;
-                    if (ldapProfileImage is not null && EnableProfileImageSync)
+                    if (ldapProfileImageTask is not null && EnableProfileImageSync)
                     {
+                        var ldapProfileImage = await ldapProfileImageTask.ConfigureAwait(false);
                         ldapProfileImageHash = Convert.ToBase64String(MD5.HashData(ldapProfileImage));
 
                         await ProfileImageUpdater.SetProfileImage(user, ldapProfileImage, serverConfigurationManager, providerManager).ConfigureAwait(false);
