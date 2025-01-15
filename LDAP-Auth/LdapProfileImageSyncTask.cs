@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Plugin.LDAP_Auth.Config;
 using Jellyfin.Plugin.LDAP_Auth.Helpers;
 using MediaBrowser.Common;
 using MediaBrowser.Controller.Authentication;
@@ -30,6 +31,7 @@ namespace Jellyfin.Plugin.LDAP_Auth
         private readonly IUserManager _userManager;
         private readonly IProviderManager _providerManager;
         private readonly IServerConfigurationManager _serverConfigurationManager;
+        private readonly IHttpClientFactory _httpClientFactory;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="LdapProfileImageSyncTask"/> class.
@@ -40,13 +42,15 @@ namespace Jellyfin.Plugin.LDAP_Auth
         /// <param name="serverConfigurationManager">Instance of the <see cref="IServerConfigurationManager"/> interface.</param>
         /// <param name="logger">Instance of the <see cref="ILogger{LDAPImageSyncScheduledTask}"/> interface.</param>
         /// <param name="localization">Instance of the <see cref="ILocalizationManager"/> interface.</param>
+        /// <param name="httpClientFactory">Instance of the <see cref="IHttpClientFactory"/> interface.</param>
         public LdapProfileImageSyncTask(
             IApplicationHost applicationHost,
             IUserManager userManager,
             IProviderManager providerManager,
             IServerConfigurationManager serverConfigurationManager,
             ILogger<LdapProfileImageSyncTask> logger,
-            ILocalizationManager localization)
+            ILocalizationManager localization,
+            IHttpClientFactory httpClientFactory)
         {
             _logger = logger;
             _localization = localization;
@@ -54,13 +58,14 @@ namespace Jellyfin.Plugin.LDAP_Auth
             _userManager = userManager;
             _providerManager = providerManager;
             _serverConfigurationManager = serverConfigurationManager;
+            _httpClientFactory = httpClientFactory;
         }
 
         private bool EnableProfileImageSync => LdapPlugin.Instance.Configuration.EnableLdapProfileImageSync;
 
         private string ProfileImageAttr => LdapPlugin.Instance.Configuration.LdapProfileImageAttribute;
 
-        private string ProfileImageAttrFormat => LdapPlugin.Instance.Configuration.LdapProfileImageAttributeFormat;
+        private PluginConfiguration.ProfileImageAttributeFormat ProfileImageAttrFormat => LdapPlugin.Instance.Configuration.LdapProfileImageAttributeFormat;
 
         /// <inheritdoc/>
         public string Name => "LDAP - Synchronize profile images";
@@ -100,27 +105,30 @@ namespace Jellyfin.Plugin.LDAP_Auth
                     continue;
                 }
 
-                byte[] ldapProfileImage = null;
-                if (ProfileImageAttrFormat == "base64")
+                Task<byte[]> ldapProfileImageTask = null;
+                var attribute = ldapAuthProvider.GetAttribute(ldapUser, ProfileImageAttr);
+                if (attribute != null)
                 {
-                    ldapProfileImage = Convert.FromBase64String(ldapAuthProvider.GetAttribute(ldapUser, ProfileImageAttr)?.StringValue);
-                }
-                else if (ProfileImageAttrFormat == "binary")
-                {
-                    ldapProfileImage = ldapAuthProvider.GetAttribute(ldapUser, ProfileImageAttr)?.ByteValue;
-                }
-                else if (ProfileImageAttrFormat == "url")
-                {
-                    using var client = new HttpClient();
-                    ldapProfileImage = await client.GetByteArrayAsync(ldapAuthProvider.GetAttribute(ldapUser, ProfileImageAttr)?.StringValue);
-                }
-                else
-                {
-                    _logger.LogError("Unknown profile image format: {Format}", ProfileImageAttrFormat);
+                    switch (ProfileImageAttrFormat)
+                    {
+                        case PluginConfiguration.ProfileImageAttributeFormat.BINARY:
+                            ldapProfileImageTask = Task.FromResult(attribute.ByteValue);
+                            break;
+                        case PluginConfiguration.ProfileImageAttributeFormat.BASE64:
+                            ldapProfileImageTask = Task.FromResult(Convert.FromBase64String(attribute.StringValue));
+                            break;
+                        case PluginConfiguration.ProfileImageAttributeFormat.URL:
+                        {
+                            using var client = _httpClientFactory.CreateClient();
+                            ldapProfileImageTask = client.GetByteArrayAsync(attribute.StringValue, cancellationToken);
+                            break;
+                        }
+                    }
                 }
 
-                if (ldapProfileImage is not null)
+                if (ldapProfileImageTask is not null)
                 {
+                    var ldapProfileImage = await ldapProfileImageTask;
                     // Found a profile image in LDAP data. Check if image changed since last synchronization and update if so
                     var ldapProfileImageHash = Convert.ToBase64String(MD5.HashData(ldapProfileImage));
 
